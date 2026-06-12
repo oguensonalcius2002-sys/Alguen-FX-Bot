@@ -1,0 +1,344 @@
+import { useState, useEffect, useRef } from "react";
+
+const PAIRS = ["EUR/USD", "GBP/USD", "AUD/USD", "BTC/USD", "ETH/USD", "XAU/USD"];
+const DURATIONS = [{ l: "30s", v: 30 }, { l: "1m", v: 60 }, { l: "5m", v: 300 }, { l: "15m", v: 900 }];
+
+const PAIR_CONFIG = {
+  "EUR/USD": { start: 1.0843, move: 0.0012, pip: 0.0004, dec: 5 },
+  "GBP/USD": { start: 1.2654, move: 0.0014, pip: 0.0005, dec: 5 },
+  "AUD/USD": { start: 0.6521, move: 0.0010, pip: 0.0003, dec: 5 },
+  "BTC/USD": { start: 67450.0, move: 180, pip: 60, dec: 2 },
+  "ETH/USD": { start: 3520.0, move: 25, pip: 8, dec: 2 },
+  "XAU/USD": { start: 2345.50, move: 3.5, pip: 1.2, dec: 2 },
+};
+
+function calcEMA(prices, period) {
+  if (prices.length < period) return null;
+  const k = 2 / (period + 1);
+  let ema = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < prices.length; i++) ema = prices[i] * k + ema * (1 - k);
+  return ema;
+}
+
+function calcRSI(prices, period = 14) {
+  if (prices.length < period + 1) return null;
+  const changes = prices.slice(-period - 1).map((p, i, a) => i === 0 ? 0 : p - a[i - 1]).slice(1);
+  const gains = changes.map(c => c > 0 ? c : 0);
+  const losses = changes.map(c => c < 0 ? -c : 0);
+  const avgGain = gains.reduce((a, b) => a + b, 0) / period;
+  const avgLoss = losses.reduce((a, b) => a + b, 0) / period;
+  if (avgLoss === 0) return 100;
+  return 100 - 100 / (1 + avgGain / avgLoss);
+}
+
+function calcMACD(prices) {
+  const ema12 = calcEMA(prices, 12);
+  const ema26 = calcEMA(prices, 26);
+  if (!ema12 || !ema26) return null;
+  return { macd: ema12 - ema26, ema12, ema26 };
+}
+
+function calcSR(prices) {
+  const sorted = [...prices].sort((a, b) => a - b);
+  return { support: sorted[Math.floor(sorted.length * 0.1)], resistance: sorted[Math.floor(sorted.length * 0.9)] };
+}
+
+function analyzeAll(candles) {
+  if (candles.length < 30) return { dir: "WAIT", conf: 0, details: {} };
+  const closes = candles.map(c => c.close);
+  const volumes = candles.map(c => c.vol);
+  const ema9 = calcEMA(closes, 9);
+  const ema21 = calcEMA(closes, 21);
+  const ema50 = calcEMA(closes.slice(-50), 50) || calcEMA(closes, closes.length);
+  const rsi = calcRSI(closes);
+  const macdData = calcMACD(closes);
+  const { support, resistance } = calcSR(closes.slice(-20));
+  const price = closes[closes.length - 1];
+  const avgVol = volumes.slice(-10).reduce((a, b) => a + b, 0) / 10;
+  const volStrong = volumes[volumes.length - 1] > avgVol * 1.2;
+  let bullish = 0, bearish = 0;
+  const signals = {};
+  if (ema9 && ema21) { signals.ema = ema9 > ema21 ? "CALL" : "PUT"; ema9 > ema21 ? bullish++ : bearish++; }
+  if (ema50) { signals.trend = price > ema50 ? "CALL" : "PUT"; price > ema50 ? bullish++ : bearish++; }
+  if (rsi !== null) {
+    if (rsi < 30) { signals.rsi = "CALL"; bullish += 2; }
+    else if (rsi > 70) { signals.rsi = "PUT"; bearish += 2; }
+    else signals.rsi = "NEUTRAL";
+  }
+  if (macdData) { signals.macd = macdData.macd > 0 ? "CALL" : "PUT"; macdData.macd > 0 ? bullish++ : bearish++; }
+  const distToSup = (price - support) / price;
+  const distToRes = (resistance - price) / price;
+  if (distToSup < 0.002) { signals.sr = "CALL"; bullish++; }
+  else if (distToRes < 0.002) { signals.sr = "PUT"; bearish++; }
+  else signals.sr = "NEUTRAL";
+  if (volStrong) { signals.vol = "STRONG"; bullish > bearish ? bullish++ : bearish++; }
+  else signals.vol = "WEAK";
+  const maxScore = 7;
+  let dir = "WAIT", conf = 0;
+  if (bullish >= 4) { dir = "CALL"; conf = Math.round((bullish / maxScore) * 100); }
+  else if (bearish >= 4) { dir = "PUT"; conf = Math.round((bearish / maxScore) * 100); }
+  return { dir, conf: Math.min(conf, 95), details: { ema9: ema9?.toFixed(5), ema21: ema21?.toFixed(5), rsi: rsi?.toFixed(1), macd: macdData?.macd?.toFixed(6), support: support?.toFixed(5), resistance: resistance?.toFixed(5), volStrong, bullish, bearish, signals } };
+}
+
+function genCandle(prev, cfg) {
+  const open = prev.close;
+  const close = open + (Math.random() - 0.48) * cfg.move;
+  const high = Math.max(open, close) + Math.random() * cfg.pip;
+  const low = Math.min(open, close) - Math.random() * cfg.pip;
+  return { open, close, high, low, vol: 800 + Math.random() * 400 };
+}
+
+function buildCandles(pair, n = 60) {
+  const cfg = PAIR_CONFIG[pair] || PAIR_CONFIG["EUR/USD"];
+  const arr = [{ open: cfg.start, close: cfg.start, high: cfg.start + cfg.pip, low: cfg.start - cfg.pip, vol: 1000 }];
+  for (let i = 1; i < n; i++) arr.push(genCandle(arr[i - 1], cfg));
+  return arr;
+}
+
+function Chart({ candles, ema9, ema21 }) {
+  const W = 320, H = 90;
+  const last = candles.slice(-30);
+  const prices = last.flatMap(c => [c.high, c.low]);
+  const min = Math.min(...prices), max = Math.max(...prices);
+  const rng = max - min || 0.001;
+  const sy = v => H - ((v - min) / rng) * (H - 10) - 5;
+  const cw = W / last.length;
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: 90, display: "block" }}>
+      <rect width={W} height={H} fill="#0d1117" rx="6" />
+      {last.map((c, i) => {
+        const x = i * cw + cw / 2, up = c.close >= c.open, col = up ? "#00d26a" : "#ff4757";
+        const bt = sy(Math.max(c.open, c.close)), bh = Math.abs(sy(c.open) - sy(c.close)) || 1;
+        return <g key={i}><line x1={x} y1={sy(c.high)} x2={x} y2={sy(c.low)} stroke={col} strokeWidth="0.6" /><rect x={x - cw * 0.35} y={bt} width={cw * 0.7} height={bh} fill={col} /></g>;
+      })}
+      {ema9 && <line x1={0} y1={sy(parseFloat(ema9))} x2={W} y2={sy(parseFloat(ema9))} stroke="#f59e0b" strokeWidth="1" strokeDasharray="3 2" />}
+      {ema21 && <line x1={0} y1={sy(parseFloat(ema21))} x2={W} y2={sy(parseFloat(ema21))} stroke="#60a5fa" strokeWidth="1" strokeDasharray="3 2" />}
+    </svg>
+  );
+}
+
+export default function App() {
+  const [pair, setPair] = useState("EUR/USD");
+  const [dur, setDur] = useState(60);
+  const [amt, setAmt] = useState("10");
+  const [candles, setCandles] = useState(() => buildCandles("EUR/USD"));
+  const [signal, setSignal] = useState(null);
+  const [scanning, setScanning] = useState(false);
+  const [countdown, setCountdown] = useState(0);
+  const [trades, setTrades] = useState([]);
+  const [balance, setBalance] = useState(500);
+  const [tab, setTab] = useState("trade");
+  const [showDetails, setShowDetails] = useState(false);
+  const timer = useRef(null);
+
+  const cfg = PAIR_CONFIG[pair] || PAIR_CONFIG["EUR/USD"];
+  const price = candles[candles.length - 1]?.close;
+  const prevPrice = candles[candles.length - 2]?.close || price;
+  const up = price >= prevPrice;
+
+  // Reset candles when pair changes
+  useEffect(() => {
+    setCandles(buildCandles(pair));
+    setSignal(null);
+  }, [pair]);
+
+  useEffect(() => {
+    const iv = setInterval(() => {
+      setCandles(prev => {
+        const next = genCandle(prev[prev.length - 1], cfg);
+        return [...prev.slice(-59), next];
+      });
+    }, 1500);
+    return () => clearInterval(iv);
+  }, [pair]);
+
+  const scan = () => {
+    setScanning(true);
+    setTimeout(() => { setSignal(analyzeAll(candles)); setScanning(false); }, 1000);
+  };
+
+  const trade = (dir) => {
+    const a = parseFloat(amt) || 10;
+    if (a > balance || countdown > 0) return;
+    setBalance(b => b - a);
+    setCountdown(dur);
+    const entry = price;
+    timer.current = setInterval(() => {
+      setCountdown(c => {
+        if (c <= 1) {
+          clearInterval(timer.current);
+          setCandles(curr => {
+            const exit = curr[curr.length - 1].close;
+            const won = dir === "CALL" ? exit > entry : exit < entry;
+            const pnl = won ? +(a * 0.85).toFixed(2) : -a;
+            setBalance(b => b + (won ? a + pnl : 0));
+            setTrades(prev => [{ id: Date.now(), pair, dir, a, res: won ? "WIN" : "LOSS", pnl, t: new Date().toLocaleTimeString() }, ...prev.slice(0, 9)]);
+            return curr;
+          });
+          return 0;
+        }
+        return c - 1;
+      });
+    }, 1000);
+  };
+
+  const wins = trades.filter(t => t.res === "WIN").length;
+  const wr = trades.length ? Math.round(wins / trades.length * 100) : 0;
+  const totalPnl = trades.reduce((s, t) => s + t.pnl, 0);
+  const sigColor = signal?.dir === "CALL" ? "#00d26a" : signal?.dir === "PUT" ? "#ff4757" : "#8b949e";
+  const d = signal?.details || {};
+  const ic = (v) => v === "CALL" ? "#00d26a" : v === "PUT" ? "#ff4757" : "#8b949e";
+
+  const s = {
+    wrap: { background: "#0d1117", minHeight: "100vh", color: "#e6edf3", fontFamily: "system-ui,sans-serif", maxWidth: 420, margin: "0 auto", paddingBottom: 72 },
+    hdr: { background: "#161b22", borderBottom: "1px solid #21262d", padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center" },
+    sec: { padding: "10px 12px 0" },
+    lbl: { fontSize: 11, color: "#8b949e", marginBottom: 5, textTransform: "uppercase", letterSpacing: .8 },
+    row: { display: "flex", gap: 6 },
+    chip: (a) => ({ flex: 1, padding: "7px 4px", borderRadius: 8, border: `1px solid ${a ? "#7c3aed" : "#21262d"}`, background: a ? "#7c3aed22" : "#161b22", color: a ? "#a78bfa" : "#8b949e", fontSize: 11, fontWeight: 600, cursor: "pointer", textAlign: "center" }),
+    inp: { width: "100%", background: "#161b22", border: "1px solid #21262d", borderRadius: 8, padding: "10px 12px", color: "#e6edf3", fontSize: 16, fontWeight: 600, boxSizing: "border-box", outline: "none" },
+    scanBtn: { width: "100%", padding: 12, borderRadius: 10, border: "none", background: "linear-gradient(135deg,#7c3aed,#a855f7)", color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer" },
+    sigBox: { background: "#161b22", border: "1px solid #21262d", borderRadius: 10, padding: "10px 12px", marginTop: 8 },
+    callBtn: { flex: 1, padding: 14, borderRadius: 10, border: "1px solid #00d26a55", background: "#00d26a15", color: "#00d26a", fontSize: 15, fontWeight: 700, cursor: "pointer" },
+    putBtn: { flex: 1, padding: 14, borderRadius: 10, border: "1px solid #ff475755", background: "#ff475715", color: "#ff4757", fontSize: 15, fontWeight: 700, cursor: "pointer" },
+    tabBar: { position: "fixed", bottom: 0, left: "50%", transform: "translateX(-50%)", width: "100%", maxWidth: 420, background: "#161b22", borderTop: "1px solid #21262d", display: "flex", zIndex: 99 },
+    tab: (a) => ({ flex: 1, padding: "12px 0", textAlign: "center", fontSize: 12, color: a ? "#a78bfa" : "#8b949e", cursor: "pointer", fontWeight: 600 }),
+    card: { background: "#161b22", border: "1px solid #21262d", borderRadius: 8, padding: "10px 12px", marginBottom: 6, display: "flex", justifyContent: "space-between", alignItems: "center" },
+    indRow: { display: "flex", justifyContent: "space-between", padding: "4px 0", borderBottom: "1px solid #21262d33", fontSize: 12 },
+  };
+
+  const pairIcon = { "XAU/USD": "🥇", "BTC/USD": "₿", "ETH/USD": "Ξ", "EUR/USD": "€", "GBP/USD": "£", "AUD/USD": "🇦🇺" };
+
+  return (
+    <div style={s.wrap}>
+      <div style={s.hdr}>
+        <span style={{ fontSize: 16, fontWeight: 700 }}>Alguen <span style={{ color: "#7c3aed" }}>FX</span> Bot</span>
+        <div style={{ textAlign: "right" }}>
+          <div style={{ fontSize: 10, color: "#8b949e" }}>BALANS</div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: "#00d26a" }}>${balance.toFixed(2)}</div>
+        </div>
+      </div>
+
+      {tab === "trade" && <>
+        <div style={s.sec}>
+          <div style={{ background: "#161b22", border: "1px solid #21262d", borderRadius: 10, overflow: "hidden" }}>
+            <div style={{ padding: "8px 12px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div>
+                <div style={{ fontSize: 10, color: "#8b949e" }}>{pairIcon[pair]} {pair}</div>
+                <div style={{ fontSize: 22, fontWeight: 800, color: up ? "#00d26a" : "#ff4757" }}>
+                  {price?.toFixed(cfg.dec)}
+                </div>
+              </div>
+              <div style={{ textAlign: "right", fontSize: 11, color: "#8b949e" }}>
+                <div><span style={{ color: "#f59e0b" }}>━</span> EMA9 &nbsp;<span style={{ color: "#60a5fa" }}>━</span> EMA21</div>
+                <div style={{ marginTop: 2 }}>{up ? "▲" : "▼"} {up ? "Ap monte" : "Ap desann"}</div>
+              </div>
+            </div>
+            <Chart candles={candles} ema9={signal?.details?.ema9} ema21={signal?.details?.ema21} />
+          </div>
+        </div>
+
+        <div style={s.sec}>
+          <div style={s.lbl}>Enstrimman</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6 }}>
+            {PAIRS.map(p => (
+              <div key={p} style={s.chip(pair === p)} onClick={() => setPair(p)}>
+                {pairIcon[p]} {p}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div style={s.sec}>
+          <div style={s.lbl}>Dire</div>
+          <div style={s.row}>{DURATIONS.map(d => <div key={d.v} style={s.chip(dur === d.v)} onClick={() => setDur(d.v)}>{d.l}</div>)}</div>
+        </div>
+
+        <div style={s.sec}>
+          <div style={s.lbl}>Montan ($)</div>
+          <input style={s.inp} type="number" value={amt} onChange={e => setAmt(e.target.value)} placeholder="10" />
+        </div>
+
+        <div style={s.sec}>
+          <button style={s.scanBtn} onClick={scan} disabled={scanning}>
+            {scanning ? "⟳ Ap analize..." : "⚡ Analize Siy — RSI · MACD · EMA · S/R"}
+          </button>
+        </div>
+
+        {signal && (
+          <div style={{ padding: "6px 12px 0" }}>
+            <div style={s.sigBox}>
+              {signal.dir === "WAIT"
+                ? <div style={{ color: "#8b949e", textAlign: "center", padding: 8 }}>⏳ Siy konfli — Tann yon opòtinite pi kle</div>
+                : <>
+                  <div style={{ fontSize: 20, fontWeight: 800, color: sigColor }}>
+                    {signal.dir === "CALL" ? "▲ MONTE (CALL)" : "▼ DESANN (PUT)"}
+                  </div>
+                  <div style={{ fontSize: 12, color: "#8b949e", marginTop: 2 }}>
+                    Konfyans: <span style={{ color: sigColor, fontWeight: 700 }}>{signal.conf}%</span>
+                    &nbsp;·&nbsp; {d.bullish}🟢 vs {d.bearish}🔴
+                  </div>
+                  <div style={{ height: 4, background: "#21262d", borderRadius: 2, marginTop: 6, overflow: "hidden" }}>
+                    <div style={{ height: "100%", width: signal.conf + "%", background: sigColor, borderRadius: 2 }} />
+                  </div>
+                  <div style={{ fontSize: 11, color: "#7c3aed", marginTop: 8, cursor: "pointer", textAlign: "center" }}
+                    onClick={() => setShowDetails(v => !v)}>
+                    {showDetails ? "▲ Kache detay" : "▼ Wè detay indicatè yo"}
+                  </div>
+                  {showDetails && (
+                    <div style={{ marginTop: 6 }}>
+                      {[["EMA 9/21 Cross", d.signals?.ema], ["EMA 50 Trend", d.signals?.trend], ["RSI (" + parseFloat(d.rsi || 0).toFixed(0) + ")", d.signals?.rsi], ["MACD", d.signals?.macd], ["Sipò/Rezistans", d.signals?.sr], ["Volim", d.signals?.vol === "STRONG" ? "CALL" : "WEAK"]].map(([name, val]) => (
+                        <div key={name} style={s.indRow}><span style={{ color: "#8b949e" }}>{name}</span><span style={{ color: ic(val), fontWeight: 700 }}>{val}</span></div>
+                      ))}
+                      <div style={s.indRow}><span style={{ color: "#8b949e" }}>Support</span><span style={{ color: "#60a5fa" }}>{d.support}</span></div>
+                      <div style={s.indRow}><span style={{ color: "#8b949e" }}>Rezistans</span><span style={{ color: "#f59e0b" }}>{d.resistance}</span></div>
+                    </div>
+                  )}
+                </>}
+            </div>
+            {countdown > 0
+              ? <div style={{ background: "#7c3aed", color: "#fff", borderRadius: 8, padding: "10px 12px", textAlign: "center", fontWeight: 700, marginTop: 6 }}>⏱ Trade aktif — {countdown}s rete</div>
+              : signal.dir !== "WAIT" && (
+                <div style={{ ...s.row, marginTop: 6 }}>
+                  <button style={s.callBtn} onClick={() => trade("CALL")}>▲ CALL</button>
+                  <button style={s.putBtn} onClick={() => trade("PUT")}>▼ PUT</button>
+                </div>
+              )}
+          </div>
+        )}
+      </>}
+
+      {tab === "stats" && (
+        <div style={s.sec}>
+          <div style={{ ...s.row, marginBottom: 10 }}>
+            {[["Trad", trades.length, "#a78bfa"], ["Win Rate", wr + "%", "#00d26a"], ["P&L", (totalPnl >= 0 ? "+" : "") + totalPnl.toFixed(2), totalPnl >= 0 ? "#00d26a" : "#ff4757"]].map(([l, v, c]) => (
+              <div key={l} style={{ flex: 1, background: "#161b22", border: "1px solid #21262d", borderRadius: 8, padding: "8px", textAlign: "center" }}>
+                <div style={{ fontSize: 18, fontWeight: 700, color: c }}>{v}</div>
+                <div style={{ fontSize: 10, color: "#8b949e" }}>{l}</div>
+              </div>
+            ))}
+          </div>
+          {trades.length === 0
+            ? <div style={{ color: "#8b949e", textAlign: "center", padding: 24 }}>Pa gen trad ankò</div>
+            : trades.map(t => (
+              <div key={t.id} style={s.card}>
+                <div>
+                  <div style={{ fontWeight: 700, fontSize: 13 }}>{pairIcon[t.pair]} {t.pair} · {t.dir}</div>
+                  <div style={{ fontSize: 11, color: "#8b949e" }}>{t.t} · ${t.a}</div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontWeight: 700, color: t.res === "WIN" ? "#00d26a" : "#ff4757" }}>{t.res === "WIN" ? "+" : ""}{t.pnl}$</div>
+                  <div style={{ fontSize: 11, color: t.res === "WIN" ? "#00d26a88" : "#ff475788" }}>{t.res}</div>
+                </div>
+              </div>
+            ))}
+        </div>
+      )}
+
+      <div style={s.tabBar}>
+        <div style={s.tab(tab === "trade")} onClick={() => setTab("trade")}>📊 Trad</div>
+        <div style={s.tab(tab === "stats")} onClick={() => setTab("stats")}>📋 Istwa</div>
+      </div>
+    </div>
+  );
+}
