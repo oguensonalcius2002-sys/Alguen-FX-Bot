@@ -1,0 +1,18 @@
+{
+  "expo": {
+    "name": "Alguen FX Bot",
+    "slug": "alguen-fx-bot",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "platforms": ["android"],
+    "android": {
+      "package": "com.alguenfxbot.app",
+      "versionCode": 1
+    },
+    "extra": {
+      "eas": {
+        "projectId": "6de79cf6-e9a6-4654-831b-818fb27e9044"
+      }
+    }
+  }
+}
